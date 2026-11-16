@@ -220,7 +220,82 @@ def main() -> int:
     check("对账清理孤儿暂存", code == 200 and info["removed_staging_files"] >= 1
           and not staging.exists(), str(info))
 
-    print("== 8. 已发布数据最终完整性 ==")
+    print("== 8. 站日盐度冲突报告（双实例） ==")
+    report_station = "BUOY-QC"
+    report_day = dt.date(2026, 11, 18)
+    a_data, a_sha = make_parquet("qc_a.parquet", station=report_station,
+                                 day=report_day, salt=0.0)
+    a_dup, dup_sha = make_parquet("qc_a2.parquet", station=report_station,
+                                  day=report_day, salt=0.0)
+    b_data, b_sha = make_parquet("qc_b.parquet", station=report_station,
+                                 day=report_day, salt=1.0)
+
+    def decl_at(rid, data, sha, base, day):
+        return req("PUT", base, f"/receipts/{rid}/declaration", {
+            "receipt_id": rid, "station_id": report_station,
+            "obs_date": day.isoformat(), "size": len(data), "sha256": sha})
+
+    for rid, data, sha, base in (
+        ("IT-QC-A", a_data, a_sha, BASE1),
+        ("IT-QC-A2", a_dup, dup_sha, BASE2),
+        ("IT-QC-B", b_data, b_sha, BASE2),
+    ):
+        decl_at(rid, data, sha, base, report_day)
+        code, body, _ = req("POST", base, f"/receipts/{rid}/content", data, raw=True)
+        check(f"{rid} 发布", code == 200, body[:160].decode())
+    check("同内容重送 SHA 相同", a_sha == dup_sha)
+
+    qpath = ("/reports/salinity-conflicts?station_id="
+             f"{report_station}&obs_date={report_day.isoformat()}")
+    code, body, _ = req("GET", BASE1, qpath)
+    report = json.loads(body)
+    check("报告可查询", code == 200, body[:200].decode())
+    check("同原件多接收号只计一次", report["source_count"] == 2
+          and report["receipt_count"] == 3, json.dumps(report)[:300])
+    check("冲突明细含 SHA 与接收号", report["status"] == "conflict"
+          and report["conflicts"][0]["timestamp_utc"]
+          == "2026-11-18T00:00:00Z"
+          and report["conflict_count"] == 24
+          and set(report["conflicts"][0]["sha256s"]) == {a_sha, b_sha}
+          and set(report["conflicts"][0]["receipt_ids"])
+          == {"IT-QC-A", "IT-QC-A2", "IT-QC-B"},
+          json.dumps(report.get("conflicts", []))[:300])
+    code, body, _ = req("GET", BASE2, qpath)
+    check("另一实例报告一致", code == 200
+          and json.loads(body)["source_count"] == 2)
+
+    code, _, _ = req("DELETE", BASE1, "/receipts/IT-QC-B")
+    code, body, _ = req("GET", BASE2, qpath)
+    check("删除后再次查询反映变化", code == 200
+          and json.loads(body)["status"] == "ok"
+          and json.loads(body)["source_count"] == 1, body[:200].decode())
+
+    anom_table = pa.table({
+        "station_id": [report_station] * 2,
+        "timestamp_utc": pa.array(
+            [dt.datetime(2026, 11, 19, h, tzinfo=dt.timezone.utc) for h in range(2)],
+            pa.timestamp("us", "UTC")),
+        "salinity": pa.array([None, float("nan")], pa.float64()),
+    })
+    anom_path = WORK / "qc_anom.parquet"
+    pq.write_table(anom_table, anom_path)
+    anom_data = anom_path.read_bytes()
+    anom_sha = hashlib.sha256(anom_data).hexdigest()
+    anom_day = "2026-11-19"
+    decl_at("IT-QC-ANOM", anom_data, anom_sha, BASE1, dt.date(2026, 11, 19))
+    req("POST", BASE1, "/receipts/IT-QC-ANOM/content", anom_data, raw=True)
+    code, body, _ = req(
+        "GET", BASE2,
+        f"/reports/salinity-conflicts?station_id={report_station}"
+        f"&obs_date={anom_day}")
+    anom_report = json.loads(body)
+    check("缺测/非有限明确标出且非无冲突", code == 200
+          and anom_report["status"] == "incomplete"
+          and anom_report["has_conflicts"] is True
+          and anom_report["missing_count"] == 1
+          and anom_report["non_finite_count"] == 1, body[:300].decode())
+
+    print("== 9. 已发布数据最终完整性 ==")
     code, body, _ = req("GET", BASE1, "/receipts", )
     states = {r["receipt_id"]: r["state"] for r in json.loads(body)}
     check("成功记录均为 PUBLISHED",

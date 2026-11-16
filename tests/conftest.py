@@ -59,6 +59,7 @@ def database(settings: Settings):
 @pytest.fixture()
 def client(settings: Settings):
     """不走 lifespan，直接装配 app 全局状态，避免事件循环嵌套。"""
+    from app.report import shutdown_scan_pool
     from app.service import shutdown_io_pool
 
     ensure_dirs(settings)
@@ -68,8 +69,9 @@ def client(settings: Settings):
     try:
         yield c
     finally:
-        # 先排空 I/O 线程池（其内 sqlite 连接随之关闭），再关事件循环与 DB
+        # 先排空 I/O/报告线程池（其内 sqlite 连接随之关闭），再关事件循环与 DB
         shutdown_io_pool()
+        shutdown_scan_pool()
         c.close()
         main_mod.db.close()
 

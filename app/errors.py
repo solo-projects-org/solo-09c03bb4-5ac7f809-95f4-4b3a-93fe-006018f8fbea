@@ -56,3 +56,17 @@ class InvalidPackage(ObsError):
 class AlreadyFinalized(ObsError):
     status_code = 409
     code = "already_finalized"
+
+
+class ReportSnapshotIncomplete(ObsError):
+    """质控报告快照期间原件集合发生变化/缺件，无法给出完整报告。"""
+
+    status_code = 409
+    code = "report_snapshot_incomplete"
+
+
+class ReportSourceUnreadable(ObsError):
+    """已发布原件无法完整读取、摘要不符或内容不可解析。"""
+
+    status_code = 500
+    code = "report_source_unreadable"

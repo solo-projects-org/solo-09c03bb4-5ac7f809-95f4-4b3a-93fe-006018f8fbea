@@ -17,6 +17,8 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import shutil
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -157,6 +159,46 @@ def _physical_usage(settings: Settings) -> tuple[int, list[str], list[str]]:
     return staging_bytes + blob_bytes, staging_files, blob_files
 
 
+def _cleanup_report_dirs(settings: Settings) -> int:
+    """清理崩溃留下的报告快照目录（obs-report-*）。
+
+    报告快照目录是请求私有的；正常结束会自行删除。进程崩溃后其中的
+    scan.lock 会被内核释放，这里在非阻塞 flock 成功后删除陈旧目录。
+    仍被活动报告持有的目录拿不到锁，且 5 分钟内的新目录一律保留，
+    避免与快照创建的微小窗口竞争。
+    """
+    removed = 0
+    try:
+        names = os.listdir(settings.lock_dir)
+    except FileNotFoundError:  # pragma: no cover - 目录由 ensure_dirs 创建
+        return 0
+    now = time.time()
+    for name in names:
+        if not name.startswith("obs-report-"):
+            continue
+        full = os.path.join(settings.lock_dir, name)
+        if not os.path.isdir(full):
+            continue
+        try:
+            if now - os.path.getmtime(full) < 300:
+                continue
+        except OSError:
+            continue
+        lock_path = os.path.join(full, "scan.lock")
+        lock = FileLock(lock_path)
+        try:
+            if not lock.acquire(blocking=False):
+                continue
+        except OSError:
+            continue
+        try:
+            shutil.rmtree(full, ignore_errors=True)
+            removed += 1
+        finally:
+            lock.release()
+    return removed
+
+
 def reconcile(settings: Settings, db: Database) -> dict[str, int]:
     """启动与周期性对账：在全局锁 + 写事务内修复所有崩溃残留。
 
@@ -266,10 +308,12 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
                     conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha,))
                     removed_blobs += 1
 
+    removed_snapshots = _cleanup_report_dirs(settings)
     return {
         "removed_staging_files": removed_staging,
         "removed_orphan_blobs": removed_blobs,
         "reset_receipts": reset_receipts,
+        "removed_report_snapshots": removed_snapshots,
     }
 
 

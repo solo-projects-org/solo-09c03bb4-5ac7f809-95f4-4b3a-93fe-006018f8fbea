@@ -8,21 +8,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 from collections.abc import AsyncIterator
 
 from fastapi import BackgroundTasks, FastAPI, Query, Request, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
 from . import __version__
 from .config import Settings, load_settings
 from .db import Database
 from .errors import ObsError
+from .report import build_report, offload_scan, shutdown_scan_pool
 from .schemas import (
     DeclarationIn,
     QuotaOut,
     ReceiptOut,
     ReconcileOut,
+    SalinityReportOut,
     UploadResult,
 )
 from .service import (
@@ -72,6 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await _reconcile_task
         shutdown_io_pool()
+        shutdown_scan_pool()
         db.close()
 
 
@@ -225,19 +229,50 @@ async def abort(receipt_id: str) -> ReceiptOut:
 @app.delete(
     "/receipts/{receipt_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    response_class=JSONResponse,
     tags=["接收"],
     summary="删除接收（唯一引用的成品一并回收）",
 )
-async def remove(receipt_id: str):
+async def remove(receipt_id: str) -> Response:
     await _offload(delete_receipt, settings, db, receipt_id)
-    return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
+    # 204 不允许响应体：必须返回空 Response，否则 uvicorn 会因
+    # “content-length 与 body 长度不符” 抛错并断开连接。
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/quota", response_model=QuotaOut, tags=["运维"], summary="查询字节额度占用")
 async def quota() -> QuotaOut:
     row = await _offload(get_quota, settings, db)
     return QuotaOut(**row)
+
+
+@app.get(
+    "/reports/salinity-conflicts",
+    response_model=SalinityReportOut,
+    tags=["质控"],
+    summary="站日盐度冲突报告（读取已发布 Parquet 原件）",
+)
+async def salinity_conflicts(
+    station_id: str = Query(..., min_length=1, max_length=64, description="浮标站号"),
+    obs_date: dt.date = Query(..., description="UTC 观测日期 YYYY-MM-DD"),
+    offset: int = Query(0, ge=0, description="冲突/异常明细起始序号（按时间排序）"),
+    limit: int = Query(1000, ge=1, le=5000, description="明细返回上限"),
+) -> SalinityReportOut:
+    """按站号 + UTC 日期汇总已发布原件的盐度冲突。
+
+    - 同内容多次重送按原件 SHA-256 去重，只参与一次比对；
+    - 同一 UTC 时刻的不同盐度列成冲突明细，附原件摘要与接收号；
+    - 缺测/非有限盐度单列标出，不计为「无冲突」；
+    - 基于查询时点的一致快照，发布/删除后再次查询即反映变化；
+    - 原件缺失或无法完整读取时返回明确错误，绝不输出不完整报告；
+    - `conflict_count` / `anomaly_count` 是完整总数，`conflicts` /
+      `anomalies` 返回 `offset..offset+limit` 窗口，可用
+      `conflicts_truncated` / `anomalies_truncated` 判断是否还有更多。
+    """
+    report = await offload_scan(
+        build_report, settings, db, station_id, obs_date,
+        offset=offset, limit=limit,
+    )
+    return SalinityReportOut(**report)
 
 
 @app.post(

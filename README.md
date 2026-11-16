@@ -23,6 +23,12 @@
 | 中断后无用文件及占额自动回收，未完成可重传 | 启动 + 周期 + 手动 `reconcile`，清理孤儿暂存/成品、回退缺件记录 |
 | 恢复不误删另一实例在途/已发布原包，不留缺件成功记录 | 全局 flock + 写事务对账；在途暂存按 DB 归属保留，缺件成品回退而非掩盖 |
 | 慢上传期间其他包仍可接收、查询 | 网络读取异步、阻塞重活进 I/O 线程池；接收级 flock 只锁同一接收号 |
+| 按站号 + UTC 日期查询已发布原件的盐度冲突 | `GET /reports/salinity-conflicts`；`app/report.py` 读取已发布 Parquet 原件 |
+| 同原件多接收号重送只计一次，列冲突明细与 SHA/接收号 | 快照内按 `blob_sha256` 去重；`conflicts[].values[].sha256s/receipt_ids` |
+| 缺测/非有限盐度明确标出，不能算作无冲突 | `missing` / `non_finite` + `salinity_state`；`has_conflicts=true` |
+| 报告对应同一时点完整原件集合，发布/删除后再查反映变化 | 全局锁内固化集合并硬链接私有快照，逐次查询重新取快照 |
+| 双实例操作与慢扫描交错不拼混杂报告，原件不可读则明确失败 | 快照隔离 + 专用扫描线程池；缺件 409 / 读取失败 500 |
+| 扫描不拖住其他包接收 | 报告扫描独立线程池，与接收 I/O 池隔离 |
 | 可启动的双实例 Docker Compose 与 Swagger 入口 | `docker-compose.yml`（app1/app2 + nginx），`/docs` Swagger |
 
 ---
@@ -37,6 +43,7 @@ app/
   schemas.py     Pydantic 请求/响应模型
   storage.py     flock 文件锁、内容寻址 blob、暂存、配额、崩溃对账
   validation.py  PyArrow Parquet 三列与站号/站日逐行校验
+  report.py      站日盐度冲突报告：快照、原件去重、时刻比对、失败语义
   service.py     声明/上传/发布/中止/删除编排，I/O 线程池
   main.py        FastAPI 路由、Swagger、后台对账、异常处理
 tests/           pytest 单元/并发/回收测试 + 自研同步 ASGI 客户端
@@ -55,6 +62,7 @@ $OBS_DATA_DIR/
   blobs/<xx>/<sha256>    内容寻址成品
   locks/rcpt-<id>.lock   接收级互斥锁
   locks/global.lock      发布/对账全局锁
+  locks/obs-report-*/    报告快照私有目录（原件硬链接 + scan.lock）
 ```
 
 ---
@@ -124,6 +132,36 @@ curl -X POST http://localhost:8080/admin/reconcile          # 手动触发回收
 辅助接口：`POST /receipts/{id}/abort`（中止在途并释放暂存）、
 `DELETE /receipts/{id}`（删除接收，唯一引用的成品一并回收）。
 
+### 站日盐度冲突报告（质控）
+
+```bash
+curl 'http://localhost:8080/reports/salinity-conflicts?station_id=BUOY-001&obs_date=2026-11-15'
+```
+
+- 只读取该站该 UTC 日期的**已发布**原件；同内容（原件 SHA-256 相同）被多个
+  接收号重送时只算一份，报告在该原件的 `receipt_ids` 下列出全部接收号。
+- `conflicts` 按 UTC 时刻列出**两个及以上不同有限盐度**：
+  每个取值附 `salinity`、原件 `sha256s` 与对应 `receipt_ids`。
+- 盐度为 NULL（缺测）或 NaN/±Inf 的行进入 `missing` / `non_finite` 并带
+  `salinity_state`（`missing` / `nan` / `positive_infinity` /
+  `negative_infinity`）。出现这类行时 `status=incomplete`、`has_conflicts=true`、
+  `clean=false`，**绝不算作无冲突**。
+- `status`：`ok`（无冲突且无缺测/非有限）/ `conflict` / `incomplete` /
+  `no_data`（该站日没有已发布原件）。
+- 每次查询取一个**一致快照**：在全局锁内固化已发布接收集合并把原件硬链接到
+  请求私有目录，然后释放锁慢扫描。扫描期间的发布/删除/对账不会混入本次报告；
+  下一次查询重新取快照，因此发布或删除后立即反映变化。
+- 原件缺失（快照时为 `409 report_snapshot_incomplete`）或无法完整读取/摘要
+  不符/不可解析（`500 report_source_unreadable`）时**明确失败**，不输出残缺
+  或「无冲突」报告。
+- `conflict_count` / `anomaly_count` / `missing_count` / `non_finite_count`
+  始终是**完整总数**；明细列表只返回 `offset..offset+limit` 窗口（默认
+  `offset=0&limit=1000`，`limit` 上限 5000），用 `conflicts_truncated` /
+  `anomalies_truncated` 判断是否还有下一页。超大站日不会生成无界响应。
+- 扫描在报告专用线程池执行，不占用接收的 I/O 线程池，慢扫描不阻塞其他包接收。
+- 快照目录位于 `$OBS_DATA_DIR/locks/obs-report-*`，正常请求结束即删除；进程
+  崩溃残留由 `reconcile` 在确认无人持有该目录的 `scan.lock` 后回收。
+
 ### Parquet 约束
 
 - 必需三列：`station_id`（字符串）、`timestamp_utc`（timestamp/date/ISO8601 字符串）、
@@ -161,16 +199,18 @@ curl -X POST http://localhost:8080/admin/reconcile          # 手动触发回收
 
 ```bash
 pip install pytest httpx pyarrow
-python -m pytest tests/                  # 29 个用例（含并发、配额、崩溃回收）
+python -m pytest tests/                  # 55 个用例（含并发、配额、崩溃回收、质控报告）
 python -W error -m pytest tests/         # 严格模式（资源告警也视为失败）
 
 # 真实双进程端到端：先按方式 B 启动两实例，再执行
-OBS_DATA_DIR=/tmp/obs-e2e python -I scripts/integration_test.py
+OBS_DATA_DIR=/tmp/obs-e2e python scripts/integration_test.py
 ```
 
 测试覆盖：完整发布/下载往返、幂等与冲突、长度/摘要/Parquet/站号/站日五类拒绝、
 去重占额、配额 507、慢上传不阻塞、同接收并发互斥、孤儿暂存/缺件成品回收、
-双 Database 连接共享状态等。
+双 Database 连接共享状态，以及站日盐度冲突报告（原件去重、冲突明细、缺测/
+非有限标记、已发布集合变更反映、慢扫描与发布/删除交错不混杂、原件缺失或损坏
+明确失败、慢扫描不阻塞接收、明细窗口与完整总数、快照目录回收）。
 
 ---
 

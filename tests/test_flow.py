@@ -275,3 +275,14 @@ def test_delete_receipt_reclaims_unique_blob(client, tmp_path, helpers, settings
     assert r.status_code == 204
     assert not blob.exists()
     assert client.get(f"/receipts/{rid}").status_code == 404
+
+
+def test_delete_returns_empty_204_body(client, tmp_path, helpers):
+    """204 不得携带响应体，否则 uvicorn 会断开连接（真实 HTTP 部署下必现）。"""
+    data = make_parquet(tmp_path / "a.parquet")
+    rid = "RCV-204"
+    _decl(client, rid, data)
+    assert client.post(f"/receipts/{rid}/content", content=data).status_code == 200
+    r = client.delete(f"/receipts/{rid}")
+    assert r.status_code == 204
+    assert r.content == b""

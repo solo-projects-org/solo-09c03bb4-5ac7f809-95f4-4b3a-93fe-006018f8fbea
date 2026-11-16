@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -71,27 +72,51 @@ class Database:
             timeout=30.0,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # 先设置忙等待，再做需要短暂排他锁的 WAL 切换：双实例同时冷启动时
+        # 后到者会等待而不是直接报 “database is locked”。
+        conn.execute("PRAGMA busy_timeout=30000")
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(50):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:  # pragma: no cover - 冷启动竞争
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                last_exc = exc
+                time.sleep(0.05 * min(attempt + 1, 10))
+        else:  # pragma: no cover - 持续锁住说明环境异常
+            raise last_exc if last_exc is not None else RuntimeError("无法切换 WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _init_schema(self) -> None:
-        with self._lock, self._conn:
-            self._conn.executescript(_SCHEMA)
-            row = self._conn.execute(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-            ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            elif int(row["value"]) != SCHEMA_VERSION:  # pragma: no cover - 迁移预留
-                raise RuntimeError(
-                    f"数据库 schema 版本 {row['value']} 与程序 {SCHEMA_VERSION} 不兼容"
-                )
+        for attempt in range(50):
+            try:
+                with self._lock, self._conn:
+                    self._conn.executescript(_SCHEMA)
+                    row = self._conn.execute(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                    ).fetchone()
+                    if row is None:
+                        self._conn.execute(
+                            "INSERT INTO schema_meta(key, value) "
+                            "VALUES ('schema_version', ?)",
+                            (str(SCHEMA_VERSION),),
+                        )
+                    elif int(row["value"]) != SCHEMA_VERSION:  # pragma: no cover
+                        raise RuntimeError(
+                            f"数据库 schema 版本 {row['value']} 与程序 "
+                            f"{SCHEMA_VERSION} 不兼容"
+                        )
+                return
+            except sqlite3.OperationalError as exc:  # pragma: no cover - 冷启动竞争
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                time.sleep(0.05 * min(attempt + 1, 10))
+        raise RuntimeError("数据库初始化持续被锁，无法建表")
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:

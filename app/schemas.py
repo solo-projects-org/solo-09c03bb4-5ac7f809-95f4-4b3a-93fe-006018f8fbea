@@ -73,3 +73,81 @@ class ReconcileOut(BaseModel):
     removed_staging_files: int
     removed_orphan_blobs: int
     reset_receipts: int
+    removed_report_snapshots: int = 0
+
+
+class ReportSourceOut(BaseModel):
+    """报告快照中的一份去重原件。"""
+
+    sha256: str
+    size: int
+    receipt_ids: list[str]
+
+
+class ConflictValueOut(BaseModel):
+    """冲突时刻下的一个不同盐度取值及其来源。"""
+
+    salinity: float
+    salinity_state: str = Field(..., description="有限值固定为 finite")
+    missing: bool = False
+    non_finite: bool = False
+    sha256s: list[str]
+    receipt_ids: list[str]
+
+
+class ConflictOut(BaseModel):
+    """同一 UTC 时刻出现多个不同有限盐度的冲突明细。"""
+
+    timestamp_utc: str
+    values: list[ConflictValueOut]
+    sha256s: list[str]
+    receipt_ids: list[str]
+
+
+class SalinityAnomalyOut(BaseModel):
+    """缺测（NULL）或非有限（NaN/±Inf）盐度的明确标记。"""
+
+    timestamp_utc: str
+    salinity: float | None = None
+    salinity_state: str = Field(
+        ..., description="missing | nan | positive_infinity | negative_infinity"
+    )
+    missing: bool
+    non_finite: bool
+    sha256: str
+    sha256s: list[str]
+    receipt_ids: list[str]
+
+
+class SalinityReportOut(BaseModel):
+    """站日盐度冲突报告（基于查询时点的一致快照）。"""
+
+    station_id: str
+    obs_date: str
+    status: str = Field(
+        ..., description="ok | conflict | incomplete | no_data"
+    )
+    has_conflicts: bool = Field(
+        ..., description="存在盐度冲突或缺测/非有限盐度时为 true，绝不误报无冲突"
+    )
+    has_value_conflicts: bool
+    has_anomalies: bool
+    clean: bool
+    conflict_count: int
+    anomaly_count: int
+    missing_count: int
+    non_finite_count: int
+    source_count: int
+    receipt_count: int
+    detail_offset: int = Field(..., description="明细窗口起点（按时间排序）")
+    detail_limit: int = Field(..., description="明细窗口最大条数")
+    conflicts_returned: int
+    anomalies_returned: int
+    conflicts_truncated: bool
+    anomalies_truncated: bool
+    sources: list[ReportSourceOut]
+    conflicts: list[ConflictOut]
+    missing: list[SalinityAnomalyOut]
+    non_finite: list[SalinityAnomalyOut]
+    anomalies: list[SalinityAnomalyOut]
+    generated_at: str
